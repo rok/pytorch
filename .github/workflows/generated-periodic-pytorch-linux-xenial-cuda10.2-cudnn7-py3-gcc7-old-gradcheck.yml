@@ -1,20 +1,18 @@
 # @generated DO NOT EDIT MANUALLY
 # Template is at:    .github/templates/linux_ci_workflow.yml.j2
 # Generation script: .github/scripts/generate_ci_workflows.py
-name: linux-bionic-py3.6-clang9
+name: periodic-pytorch-linux-xenial-cuda10.2-cudnn7-py3-gcc7-old-gradcheck
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, unassigned]
-  push:
-    branches:
-      - master
-      - release/*
+  schedule:
+    - cron: 45 0,4,8,12,16,20 * * *
   workflow_dispatch:
 
 env:
-  BUILD_ENVIRONMENT: linux-bionic-py3.6-clang9
-  DOCKER_IMAGE_BASE: 308535385114.dkr.ecr.us-east-1.amazonaws.com/pytorch/pytorch-linux-bionic-py3.6-clang9
+  BUILD_ENVIRONMENT: periodic-pytorch-linux-xenial-cuda10.2-cudnn7-py3-gcc7-old-gradcheck
+  DOCKER_IMAGE_BASE: 308535385114.dkr.ecr.us-east-1.amazonaws.com/pytorch/pytorch-linux-xenial-cuda10.2-cudnn7-py3-gcc7
   SCCACHE_BUCKET: ossci-compiler-cache-circleci-v2
   XLA_CLANG_CACHE_S3_BUCKET_NAME: ossci-compiler-clang-cache-circleci-xla
   TORCH_CUDA_ARCH_LIST: 5.2
@@ -31,14 +29,14 @@ env:
   CIRCLE_PR_NUMBER: ${{ github.event.pull_request.number }}
   CIRCLE_SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
 concurrency:
-  group: linux-bionic-py3.6-clang9-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  group: periodic-pytorch-linux-xenial-cuda10.2-cudnn7-py3-gcc7-old-gradcheck-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
   cancel-in-progress: true
 
 jobs:
 
   ciflow_should_run:
     runs-on: ubuntu-18.04
-    if: ${{ (github.repository == 'pytorch/pytorch') && ((github.event_name != 'pull_request') || (github.event.assignee.login != 'pytorchbot' ) || (github.event.action !='unassigned') || (contains(github.event.pull_request.labels.*.name, 'ciflow/all') || contains(github.event.pull_request.labels.*.name, 'ciflow/cpu') || contains(github.event.pull_request.labels.*.name, 'ciflow/default') || contains(github.event.pull_request.labels.*.name, 'ciflow/linux') || contains(github.event.pull_request.labels.*.name, 'ciflow/noarch') || contains(github.event.pull_request.labels.*.name, 'ciflow/xla'))) }}
+    if: ${{ (github.repository == 'pytorch/pytorch') && ((github.event_name != 'pull_request') || (github.event.assignee.login != 'pytorchbot' ) || (github.event.action !='unassigned') || (contains(github.event.pull_request.labels.*.name, 'ciflow/all') || contains(github.event.pull_request.labels.*.name, 'ciflow/cuda') || contains(github.event.pull_request.labels.*.name, 'ciflow/default') || contains(github.event.pull_request.labels.*.name, 'ciflow/linux') || contains(github.event.pull_request.labels.*.name, 'ciflow/slow') || contains(github.event.pull_request.labels.*.name, 'ciflow/slow-gradcheck'))) }}
     env:
       LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
     steps:
@@ -155,7 +153,7 @@ jobs:
     needs: [calculate-docker-image, ciflow_should_run]
     env:
       DOCKER_IMAGE: ${{ needs.calculate-docker-image.outputs.docker_image }}
-      JOB_BASE_NAME: linux-bionic-py3.6-clang9-build
+      JOB_BASE_NAME: periodic-pytorch-linux-xenial-cuda10.2-cudnn7-py3-gcc7-old-gradcheck-build
     steps:
       - name: Display EC2 information
         shell: bash
@@ -308,7 +306,7 @@ jobs:
     runs-on: ubuntu-18.04
     needs: [ciflow_should_run]
     env:
-      TEST_RUNNER_TYPE: linux.2xlarge
+      TEST_RUNNER_TYPE: linux.8xlarge.nvidia.gpu
       ENABLE_DISTRIBUTED_TEST: ''
       ENABLE_JIT_LEGACY_TEST: ''
       ENABLE_MULTIGPU_TEST: ''
@@ -318,7 +316,7 @@ jobs:
       ENABLE_DOCS_TEST: ''
       ENABLE_BACKWARDS_COMPAT_TEST: ''
       ENABLE_XLA_TEST: ''
-      ENABLE_NOARCH_TEST: 1
+      ENABLE_NOARCH_TEST: ''
       NUM_TEST_SHARDS: 2
       MULTIGPU_RUNNER_TYPE: linux.16xlarge.nvidia.gpu
       NOGPU_RUNNER_TYPE: linux.2xlarge
@@ -346,7 +344,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       DOCKER_IMAGE: ${{ needs.calculate-docker-image.outputs.docker_image }}
-      JOB_BASE_NAME: linux-bionic-py3.6-clang9-test
+      JOB_BASE_NAME: periodic-pytorch-linux-xenial-cuda10.2-cudnn7-py3-gcc7-old-gradcheck-test
       TEST_CONFIG: ${{ matrix.config }}
       SHARD_NUMBER: ${{ matrix.shard }}
       NUM_TEST_SHARDS: ${{ matrix.num_shards }}
@@ -538,7 +536,7 @@ jobs:
         env:
           AWS_DEFAULT_REGION: us-east-1
           CIRCLE_BRANCH: ${{ steps.parse-ref.outputs.branch }}
-          JOB_BASE_NAME: linux-bionic-py3.6-clang9-test
+          JOB_BASE_NAME: periodic-pytorch-linux-xenial-cuda10.2-cudnn7-py3-gcc7-old-gradcheck-test
           CIRCLE_PR_NUMBER: ${{ github.event.pull_request.number }}
           CIRCLE_SHA1: ${{ github.event.pull_request.head.sha || github.sha }}
           CIRCLE_TAG: ${{ steps.parse-ref.outputs.tag }}
