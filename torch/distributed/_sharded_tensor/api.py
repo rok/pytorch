@@ -1,10 +1,10 @@
-import collections
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
     Dict,
-    List
+    List,
+    Optional,
 )
 
 import threading
@@ -23,6 +23,7 @@ from torch.distributed._sharding_spec._internals import (
     validate_non_overlapping_shards_metadata,
     get_split_size,
     get_chunked_dim_size,
+    check_tensor_size_and_flatten,
 )
 from torch.types import Number
 from .ops import sharded_linear
@@ -232,14 +233,7 @@ class ShardedTensor(object):
         if tensor_init_params.tensor_properties.memory_format != torch.contiguous_format:
             raise ValueError('Only torch.contiguous_format memory_format is currently supported')
 
-        if len(size) == 1 and isinstance(size[0], collections.Sequence):
-            dims = list(*size)
-        else:
-            dims = list(size)
-
-        for dim in dims:
-            if not isinstance(dim, int):
-                raise TypeError(f'size has to be a sequence of ints, found: {type(dim)}')
+        dims = check_tensor_size_and_flatten(size)
 
         self._sharding_spec = sharding_spec
 
@@ -265,7 +259,6 @@ class ShardedTensor(object):
 
         self._local_shards: List[Shard] = []
         self._remote_shards: Dict[int, List[rpc.RRef[Shard]]] = {}
-        self._sharding_metadata: List[ShardMetadata] = []
 
     def _post_init(self):
         with _sharded_tensor_lock:
@@ -339,110 +332,182 @@ class ShardedTensor(object):
     def _init_from_local_shards(
         cls,
         local_shards: List[Shard],
-        sharded_tensor_metadata: ShardedTensorMetadata,
+        *overall_size,
         process_group=None,
         init_rrefs=False,
     ):
-        shards_metadata = sharded_tensor_metadata.shards_metadata
-        tensor_properties = sharded_tensor_metadata.tensor_properties
-
-        if len(shards_metadata) == 0:
-            raise ValueError("shards_metadata must not be empty!")
-
-        if tensor_properties.layout != torch.strided:
-            raise ValueError('Only torch.strided layout is currently supported')
-
-        sharded_tensor = cls.__new__(cls)
-
         # prepare initialization
+        sharded_tensor = cls.__new__(cls)
         sharded_tensor._prepare_init(process_group=process_group, init_rrefs=init_rrefs)
-
-        sharded_tensor._metadata = sharded_tensor_metadata
-
-        # no sharding spec for sharded tensors that initialized
-        # from this API.
-        sharded_tensor._sharding_spec = None
-
         current_rank = dist.get_rank(sharded_tensor._process_group)
+        world_size = dist.get_world_size(sharded_tensor._process_group)
 
-        local_shard_metadatas = []
+        local_shard_metadatas: List[ShardMetadata] = []
+        local_sharded_tensor_metadata: Optional[ShardedTensorMetadata] = None
+        global_size = torch.Size(check_tensor_size_and_flatten(overall_size))
 
-        # collect local shard metadatas from the global sharded_tensor_metadata
-        for shard_metadata in shards_metadata:  # type: ignore[attr-defined]
-            rank, local_device = sharded_tensor._parse_and_validate_remote_device(shard_metadata.placement)
+        if len(local_shards) > 0:
+            local_shards_dtype = local_shards[0].tensor.dtype
+            local_shards_layout = local_shards[0].tensor.layout
+            local_shards_requires_grad = local_shards[0].tensor.requires_grad
+            local_shards_is_pinned = local_shards[0].tensor.is_pinned()
+            # pick a device from any local shards and use it for collective later
+            local_shards_device = "cpu"
 
-            if current_rank == rank:
-                local_shard_metadatas.append(shard_metadata)
+            # 1. Validate local tensors and associated metadatas
+            for local_shard in local_shards:
+                local_shard_tensor = local_shard.tensor
+                local_shard_meta = local_shard.metadata
+                local_shard_metadatas.append(local_shard_meta)
+                rank, local_device = sharded_tensor._parse_and_validate_remote_device(local_shard_meta.placement)
+                local_shards_device = local_device
 
-        if len(local_shards) != len(local_shard_metadatas):
-            raise RuntimeError(
-                f'Number of local shards ({len(local_shards)}) does not match number of local '
-                f'shards metadata in sharded_tensor_metadata ({len(local_shard_metadatas)}) '
-                f'on rank ({current_rank}) '
+                if local_shard_tensor.layout != torch.strided or local_shard_tensor.layout != local_shards_layout:
+                    raise ValueError(
+                        f'Only torch.strided layout is currently supported, but found '
+                        f'{local_shard_tensor.layout} on rank:{current_rank}!'
+                    )
+
+                if not local_shard_tensor.is_contiguous():
+                    raise ValueError('Only torch.contiguous_format memory_format is currently supported!')
+
+                if local_shard_meta.shard_lengths != list(local_shard_tensor.size()):
+                    raise ValueError(
+                        f'Local shard tensor size does not match with local ShardMetadata on rank:{current_rank}! '
+                        f'Found local shard tensor size: {local_shard_tensor.size()}, '
+                        f'local ShardMetadata shard lengths: {local_shard_meta.shard_lengths}'
+                    )
+
+                if rank != current_rank:
+                    raise ValueError(
+                        f"Local shard metadata's rank does not match with the rank in its process group! "
+                        f'Found current rank in the process group: {current_rank}, '
+                        f"local ShardMetadata placement's rank: {rank}"
+                    )
+
+                if local_shard_tensor.is_pinned() != local_shards_is_pinned:
+                    raise ValueError(
+                        f"Local shards' tensor pin_memory property need to be the same! "
+                        f"Found one local shard tensor is_pinned(): {local_shards_is_pinned}, "
+                        f"the other local shard tensor is_pinned(): {local_shard_tensor.is_pinned()}"
+                    )
+
+                if local_shard_tensor.device != local_device:
+                    raise ValueError(
+                        f"Local shard tensor device does not match with local Shard's placement! "
+                        f"Found local shard tensor device: {local_shard_tensor.device}, "
+                        f"local shard metadata placement device: {local_device}"
+                    )
+
+                if local_shard_tensor.dtype != local_shards_dtype:
+                    raise ValueError(
+                        f"Local shards' tensor dtype property need to be the same! "
+                        f"Found one local shard tensor dtype: {local_shards_dtype}, "
+                        f"the other local shard tensor dtype: {local_shard_tensor.dtype}"
+                    )
+
+                if local_shard_tensor.requires_grad != local_shards_requires_grad:
+                    raise ValueError(
+                        f"Local shards' tensor requires_grad property need to be the same! "
+                        f"Found one local shard tensor requires_grad: {local_shards_requires_grad}, "
+                        f"the other local shard tensor requires_grad: {local_shard_tensor.requires_grad}"
+                    )
+            local_tensor_properties = TensorProperties(
+                dtype=local_shards_dtype,
+                layout=local_shards_layout,
+                requires_grad=local_shards_requires_grad,
+                memory_format=torch.contiguous_format,
+                pin_memory=local_shards_is_pinned
             )
 
-        for shard in local_shards:
-            shard_meta = shard.metadata
-            local_shard_tensor = shard.tensor
-            rank, local_device = sharded_tensor._parse_and_validate_remote_device(shard_meta.placement)
+            # 2. Build a "local" ShardedTensorMetadata with all local shards on this rank, then
+            #    do all_gather to collect local_sharded_tensor_metadata from all ranks
+            local_sharded_tensor_metadata = ShardedTensorMetadata(
+                shards_metadata=local_shard_metadatas,
+                size=global_size,
+                tensor_properties=local_tensor_properties)
+        else:
+            # if there's no local_shards, we don't need to verify anything, and this rank will only
+            # hold a handle of the global sharded tensor
+            local_shards_device = ""
 
-            # validate if shard_meta in the metadatas collected from sharded_tensor_metadata
-            assert shard_meta in local_shard_metadatas, \
-                "local shard metadata not in sharded_tensor_metadata!"
+        gathered_metadatas = [None for _ in range(world_size)]
 
-            if local_shard_tensor.layout != tensor_properties.layout:
-                raise ValueError(
-                    f'Local shard tensor layout does not match with tensor_properties! '
-                    f'local shard tensor layout: {local_shard_tensor.dtype}, '
-                    f'tensor_properties layout: {tensor_properties.layout}'
+        if "cuda" in str(local_shards_device):
+            # with GPU/NCCL, we need to set a device for all_gather_object
+            # to use as we need to know which device we should put the
+            # serialized tensor on before the NCCL collective.
+            with torch.cuda.device(local_shards_device):
+                dist.all_gather_object(
+                    gathered_metadatas,
+                    local_sharded_tensor_metadata,
+                    group=sharded_tensor._process_group
                 )
+        else:
+            dist.all_gather_object(
+                gathered_metadatas,
+                local_sharded_tensor_metadata,
+                group=sharded_tensor._process_group
+            )
 
-            if not local_shard_tensor.is_contiguous():
-                raise ValueError('Only torch.contiguous_format memory_format is currently supported')
+        # 3. Validate the gathered metadatas and build up a global sharded tensor metadata
+        global_sharded_tensor_metadata = None
+        global_metadata_rank = 0
 
-            if shard_meta.shard_lengths != list(local_shard_tensor.size()):
+        # for i in range(1, len(gathered_metadatas)):
+        for rank, rank_metadata in enumerate(gathered_metadatas):
+            if rank_metadata is None:
+                continue
+
+            if global_sharded_tensor_metadata is None:
+                global_sharded_tensor_metadata = rank_metadata
+                global_metadata_rank = rank
+            elif global_sharded_tensor_metadata.size != rank_metadata.size:
                 raise ValueError(
-                    f'Local shard tensor is incompatible with local ShardMetadata! '
-                    f'local shard tensor size: {local_shard_tensor.size()}, '
-                    f'local ShardMetadata shard lengths: {shard_meta.shard_lengths}'
+                    f'ShardedTensor overall_size does not match from different ranks! '
+                    f'Found overall_size={global_sharded_tensor_metadata.size} on rank {global_metadata_rank}, '
+                    f'and overall_size={rank_metadata.size} on rank {rank}'
                 )
-
-            if local_shard_tensor.is_pinned() != tensor_properties.pin_memory:
+            # don't need to check layout and memory format as we already checked in local shards validation stage
+            elif global_sharded_tensor_metadata.tensor_properties.dtype != rank_metadata.tensor_properties.dtype:
                 raise ValueError(
-                    f'Local shard tensor pin_memory does not match with tensor_properties! '
-                    f'local shard tensor pin_memory: {local_shard_tensor.is_pinned()}, '
-                    f'tensor_properties pin_memory: {tensor_properties.pin_memory}'
+                    f'ShardedTensor dtype property does not match from different ranks! '
+                    f'Found dtype={global_sharded_tensor_metadata.tensor_properties.dtype} on rank {global_metadata_rank}, '
+                    f'and dtype={rank_metadata.tensor_properties.dtype} on rank {rank}'
                 )
-
-            if local_shard_tensor.device != local_device:
+            elif global_sharded_tensor_metadata.tensor_properties.requires_grad != \
+                    rank_metadata.tensor_properties.requires_grad:
                 raise ValueError(
-                    f'Local shard tensor device does not match with local Shard placement! '
-                    f'local shard tensor device: {local_shard_tensor.device}, '
-                    f'local shard metadata placement device: {local_device}'
+                    f'ShardedTensor requires_grad property does not match from different ranks! '
+                    f'Found requires_grad={global_sharded_tensor_metadata.tensor_properties.requires_grad} on '
+                    f'rank {global_metadata_rank} and requires_grad={rank_metadata.tensor_properties.requires_grad} '
+                    f'on rank {rank}'
                 )
-
-            if local_shard_tensor.dtype != tensor_properties.dtype:
+            elif global_sharded_tensor_metadata.tensor_properties.pin_memory != \
+                    rank_metadata.tensor_properties.pin_memory:
                 raise ValueError(
-                    f'Local shard tensor dtype does not match with tensor_properties! '
-                    f'local shard tensor dtype: {local_shard_tensor.dtype}, '
-                    f'tensor_properties dtype: {tensor_properties.dtype}'
+                    f'ShardedTensor pin_memory property does not match from different ranks! '
+                    f'Found is_pinned(): {global_sharded_tensor_metadata.tensor_properties.pin_memory} on '
+                    f'rank {global_metadata_rank} and is_pinned(): {rank_metadata.tensor_properties.pin_memory} on rank {rank}'
                 )
+            else:
+                # pass all validations, extend shards metadata
+                global_sharded_tensor_metadata.shards_metadata.extend(rank_metadata.shards_metadata)
 
-            if local_shard_tensor.requires_grad != tensor_properties.requires_grad:
-                raise ValueError(
-                    f'Local shard tensor requires_grad does not match with tensor_properties! '
-                    f'local shard tensor requires_grad: {local_shard_tensor.requires_grad}, '
-                    f'tensor_properties requires_grad: {tensor_properties.requires_grad}'
-                )
+        if global_sharded_tensor_metadata is None:
+            raise ValueError("ShardedTensor have no local shards on all ranks!")
 
         # check if shards_metadata have overlap shards
-        validate_non_overlapping_shards_metadata(shards_metadata)
+        validate_non_overlapping_shards_metadata(global_sharded_tensor_metadata.shards_metadata)
 
         # check if the shards_metadata is compatible with overall size of the sharded tensor.
-        check_tensor(shards_metadata, list(sharded_tensor_metadata.size))
+        check_tensor(global_sharded_tensor_metadata.shards_metadata, global_sharded_tensor_metadata.size)
 
-        # done validation, add local_shards
+        # done validation, add to metadata and local_shards
+        sharded_tensor._metadata = global_sharded_tensor_metadata
         sharded_tensor._local_shards = local_shards
+        # no sharding spec for sharded tensors that initialized from this API.
+        sharded_tensor._sharding_spec = None
 
         # run post initialization, i.e. map registration, rpc initialization
         sharded_tensor._post_init()
