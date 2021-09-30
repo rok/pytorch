@@ -2046,6 +2046,15 @@ works_list = [
     'unsqueeze',
     'view',
     'where',
+    'Tensor.bool',
+    'Tensor.byte',
+    'Tensor.char',
+    'Tensor.double',
+    'Tensor.float',
+    'Tensor.half',
+    'Tensor.int',
+    'Tensor.long',
+    'Tensor.short',
 ]
 
 known_failures = [
