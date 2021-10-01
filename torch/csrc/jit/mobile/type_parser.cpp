@@ -2,6 +2,7 @@
 
 #include <ATen/core/jit_type.h>
 #include <torch/csrc/jit/frontend/parser_constants.h>
+#include <torch/csrc/jit/mobile/runtime_compatibility.h>
 #include <torch/custom_class.h>
 #include <queue>
 
@@ -16,6 +17,12 @@ using torch::jit::valid_single_char_tokens;
 
 namespace c10 {
 namespace {
+
+// Torchbind custom class always starts with the follow prefix, so use it as an
+// identifier for torchbind custom class type
+static constexpr const char* kTypeTorchbindCustomClass =
+    "__torch__.torch.classes";
+
 bool isSpecialChar(char a) {
   for (const char* c = valid_single_char_tokens; *c; c++) {
     if (a == *c)
@@ -30,16 +37,30 @@ TypeParser::TypeParser(std::string pythonStr)
   lex();
 }
 
-TypePtr TypeParser::parse() {
-  std::string token = next();
-  auto simpleTypeIt = string_to_type_lut().find(token);
-  if (simpleTypeIt != string_to_type_lut().end()) {
-    if (cur() != "]" && cur() != "," && cur() != "") {
-      TORCH_CHECK(
-          false, "Simple type ", token, " is followed by ", "invalid chars.");
-    }
-    return simpleTypeIt->second;
-  } else if (token == "List") {
+// The list of non-simple types supported by currrent parser.
+std::unordered_set<std::string> TypeParser::getNonSimpleType() {
+  static std::unordered_set<std::string> nonSimpleTypes{
+      "List", "Union", "Optional", "Future", "Dict", "Tuple"};
+  return nonSimpleTypes;
+}
+
+// The list of custom types supported by currrent parser.
+std::unordered_set<std::string> TypeParser::getCustomType() {
+  static std::unordered_set<std::string> customeTypes{
+      kTypeTorchbindCustomClass};
+  return customeTypes;
+}
+
+// Given a PyThon str, get all contained types. It's usually used for
+// compatibility check between model and runtime. For example:
+// PyThon string: "Dict[int, Tuple[Tensor, Tensor, Tensor]]"
+// contained type is: [Dict, int, Tuple, Tensor]
+std::unordered_set<std::string> TypeParser::getContainedTypes() {
+  return contained_types_;
+}
+
+TypePtr TypeParser::parseNonSimple(const std::string& token) {
+  if (token == "List") {
     return CreateSingleElementType<ListType>();
   } else if (token == "Optional") {
     return CreateSingleElementType<OptionalType>();
@@ -63,20 +84,33 @@ TypePtr TypeParser::parse() {
     }
     expect("]");
     return TupleType::create(types);
-  } else if (token == "__torch__") {
-    return parseClassType();
-  } else {
-    TORCH_CHECK(
-        false,
-        "Type ",
-        token,
-        " is not supported in the parser, ",
-        "or the token is in wrong format.");
   }
   return nullptr;
 }
 
-TypePtr TypeParser::parseClassType() {
+TypePtr TypeParser::parse() {
+  std::string token = next();
+  auto simpleTypeIt = string_to_type_lut().find(token);
+  if (simpleTypeIt != string_to_type_lut().end()) {
+    if (cur() != "]" && cur() != "," && cur() != "") {
+      TORCH_CHECK(
+          false, "Simple type ", token, " is followed by ", "invalid chars.");
+    }
+    contained_types_.insert(token);
+    return simpleTypeIt->second;
+  } else if (getNonSimpleType().find(token) != getNonSimpleType().end()) {
+    contained_types_.insert(token);
+    return parseNonSimple(token);
+  } else if (token == "__torch__") {
+    return parseTorchbindClassType();
+  } else {
+    TORCH_CHECK(
+        false, "Simple type ", token, " is followed by ", "invalid chars.");
+  }
+  return simpleTypeIt->second;
+}
+
+TypePtr TypeParser::parseTorchbindClassType() {
   std::vector<std::string> expected_atoms{".", "torch", ".", "classes", "."};
   for (const auto& atom : expected_atoms) {
     expect(atom);
@@ -85,9 +119,9 @@ TypePtr TypeParser::parseClassType() {
   std::string ns = next();
   expect(".");
   std::string classname = next();
-
-  return torch::getCustomClass(
-      std::string("__torch__.torch.classes." + ns + "." + classname));
+  contained_types_.insert(kTypeTorchbindCustomClass);
+  return torch::getCustomClass(std::string(kTypeTorchbindCustomClass)
+                                   .append("." + ns + "." + classname));
 }
 
 void TypeParser::expect(const std::string& s) {
@@ -145,7 +179,8 @@ std::string& TypeParser::cur() {
 }
 
 TORCH_API TypePtr parseType(const std::string& pythonStr) {
-  TypeParser paser(pythonStr);
-  return paser.parse();
+  TypeParser parser(pythonStr);
+  return parser.parse();
 }
+
 } // namespace c10

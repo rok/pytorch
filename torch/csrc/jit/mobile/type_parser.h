@@ -6,9 +6,13 @@ class TypeParser {
   explicit TypeParser(std::string pythonStr);
 
   TypePtr parse();
+  static std::unordered_set<std::string> getNonSimpleType();
+  static std::unordered_set<std::string> getCustomType();
+  std::unordered_set<std::string> getContainedTypes();
 
  private:
-  TypePtr parseClassType();
+  TypePtr parseTorchbindClassType();
+  TypePtr parseNonSimple(const std::string& token);
 
   void expect(const std::string& s);
 
@@ -24,6 +28,9 @@ class TypeParser {
   std::string pythonStr_;
   size_t start_;
   std::string next_token_;
+
+  // Store all contained types when parsing a string
+  std::unordered_set<std::string> contained_types_;
 };
 
 TORCH_API TypePtr parseType(const std::string& pythonStr);
