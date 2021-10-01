@@ -21,6 +21,11 @@ from torch.ao.quantization import (
     FusedMovingAvgObsFakeQuantize,
 )
 
+from torch.quantization.quantization_mappings import (
+    get_default_qat_module_mappings,
+    get_default_static_quant_module_mappings,
+)
+
 import torch.nn as nn
 
 # Standard library
@@ -1118,6 +1123,52 @@ class TestFusedObsFakeQuantModule(TestCase):
         self.assertEqual(obs.quant_min, 0)
         self.assertEqual(obs.quant_max, 127)
 
+    def test_embedding_bag_qat_config(self):
+        class Model(nn.Module):
+            def __init__(self):
+                super(Model, self).__init__()
+                self.emb1 = torch.nn.EmbeddingBag(num_embeddings=10, embedding_dim=12,
+                                                  include_last_offset=True, scale_grad_by_freq=False, mode='sum')
+                self.emb2 = torch.nn.EmbeddingBag(num_embeddings=10, embedding_dim=12,
+                                                  include_last_offset=True, scale_grad_by_freq=False, mode='sum')
+                # Note for EmbeddingBag, indices should never be quantized, only outputs
+                self.dequant = torch.quantization.DeQuantStub()
+
+            def forward(self, indices):
+                x = torch.cat((self.emb1(indices), self.emb2(indices)))
+                return self.dequant(x)
+
+        model = Model()
+        indices = torch.randint(0, 10, (5, 12))
+        qat_mappings = get_default_qat_module_mappings()
+        float_qparams_fakequant = FakeQuantize.with_args(observer=PerChannelMinMaxObserver,
+                                                         qscheme=torch.per_channel_affine_float_qparams,
+                                                         ch_axis=0,
+                                                         memoryless=True)
+        float_qparams_qconfig = QConfig(activation=NoopObserver,
+                                        weight=float_qparams_fakequant)
+        model.qconfig = float_qparams_qconfig
+
+        quant_model = torch.quantization.prepare_qat(model, mapping=qat_mappings)
+
+        count_fake_quant = 0
+        for name, mod in quant_model.named_modules():
+            if name.endswith('weight_fake_quant'):
+                count_fake_quant += 1
+                self.assertEqual(type(mod), FakeQuantize)
+
+        self.assertEqual(count_fake_quant, 2)
+
+        quant_model(indices)
+
+        convert_mappings = get_default_static_quant_module_mappings()
+        inference_gm = torch.quantization.convert(quant_model.eval().cpu(), convert_mappings)
+
+        # Ensure that EmbeddingBags are now quantized
+        self.assertEqual(type(inference_gm.emb1), torch.nn.quantized.EmbeddingBag)
+        self.assertEqual(type(inference_gm.emb2), torch.nn.quantized.EmbeddingBag)
+
+
     def test_default_fused_qat_config(self):
         class Model(nn.Module):
             def __init__(self):
@@ -1148,6 +1199,7 @@ class TestFusedObsFakeQuantModule(TestCase):
                     count_fake_quant += 1
                     self.assertEqual(type(mod), FusedMovingAvgObsFakeQuantize)
 
+            print(ref_model)
             self.assertEqual(count_fake_quant, 3)
 
             if qengine == "fbgemm":
