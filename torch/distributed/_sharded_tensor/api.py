@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
     Dict,
-    List
+    List,
+    Optional,
 )
 
 import threading
@@ -176,6 +177,33 @@ class TensorInitParams(object):
                                  memory_format=torch.contiguous_format,
                                  pin_memory=False))
 
+def _validate_output_tensor_for_gather(
+    my_rank: int,
+    dst_rank: int,
+    size: torch.Size,
+    dst_tensor: Optional[torch.Tensor],
+) -> None:
+    if dst_rank == my_rank:
+        if dst_tensor is None:
+            raise ValueError(
+                f"Argument ``dst_tensor`` must be specified on destination rank {dst_rank}"
+            )
+        curr_device = torch.device(f"cuda:{my_rank}")
+        if tuple(size) != (dst_tensor.size()):
+            raise ValueError(
+                f"Argument ``dst_tensor`` have size {tuple(dst_tensor.size())},"
+                f"but should be {tuple(size)}"
+            )
+        if dst_tensor.device != curr_device:
+            raise ValueError(
+                f"Argument ``dst_tensor`` should be created on device {curr_device},"
+                f"but found on {dst_tensor.device}"
+            )
+    elif dst_tensor:
+        raise ValueError(
+            "Argument ``dst_tensor`` must NOT be specified "
+            "on non-destination ranks."
+        )
 
 class ShardedTensor(object):
     """
@@ -194,7 +222,7 @@ class ShardedTensor(object):
     create_op specified by tensor_init_params.create_op, e.g., torch.ones, or
     torch.empty
 
-    Args:
+    Arg:
         sharding_spec (:class:`torch.distributed._sharding_spec.ShardingSpec`): The specification
             describing how to shard the Tensor.
         size (int...): a sequence of integers defining the shape of the output
@@ -334,6 +362,62 @@ class ShardedTensor(object):
 
         # Barrier for all RPCs to finish on all ranks.
         rpc.api._all_gather(None)
+
+    def gather(
+        self,
+        dst: int = 0,
+        out: Optional[torch.Tensor] = None,
+    ) -> None:
+        """
+        Creates a full :class:`Tensor` on rank `dst` by gathering all sharded tensors.
+
+        The API needs to be called on all ranks in SPMD fashion. All ranks should have
+        the same `dst`. `out` should be a full size zero tensor on `dst` and
+        None on all other ranks.
+
+        TODO: current only supports GPU. Will enable CPU and revise to replace
+              all_gather_object() to gather().
+
+        Args:
+            dst(int): The rank where full tensor is constructed. Default is 0.
+            out (:class `torch.Tensor` optional): The output full tensor. Must to be provided
+            ONLY on `dst` rank. Default is None.
+        """
+        my_rank = dist.get_rank(self._process_group)
+        full_size = self.metadata().size
+        _validate_output_tensor_for_gather(my_rank, dst, full_size, out)
+        curr_device = torch.device(f"cuda:{my_rank}")
+
+        shard_tensors = self.local_shards()
+        world_size = dist.get_world_size(self._process_group)
+
+        gathered_shards = [None] * world_size
+        # TODO all_gather_object is not efficient. will revise this part once
+        # NCCL support for dist.gather() is ready
+        with torch.cuda.device(curr_device):
+            dist.all_gather_object(
+                obj=shard_tensors,
+                object_list=gathered_shards,
+                group=self._process_group,
+            )
+
+        if my_rank == dst:
+            dims = len(full_size)
+            for shards in gathered_shards:
+                assert shards is not None, f"gathered shards cannot be None on {dst}"
+                for shard in shards:
+                    metadata = shard.metadata
+                    tensor = shard.tensor
+
+                    out_narrow_view = out
+                    for dim in range(dims):
+                        out_narrow_view = out_narrow_view.narrow(
+                            dim,
+                            metadata.shard_offsets[dim],
+                            metadata.shard_lengths[dim],
+                        )
+
+                    out_narrow_view.copy_(tensor)
 
     @classmethod
     def _init_from_local_shards(
