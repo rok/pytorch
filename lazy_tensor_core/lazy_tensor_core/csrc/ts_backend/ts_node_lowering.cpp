@@ -467,15 +467,15 @@ class TSNodeLowering : public NodeLowering {
     const ir::Output& input = conv_backward->operand(1);
     const ir::Output& weight = conv_backward->operand(2);
     return lazy_tensors::ShapeUtil::MakeTupleShape(
-        {input.shape(), weight.shape(), self.shape()});
+        {GetShapeFromTsOutput(input), GetShapeFromTsOutput(weight), GetShapeFromTsOutput(self)});
   }
 
   static lazy_tensors::Shape InferConvolutionOverrideable(
       const ir::ops::ConvolutionOverrideable* conv) {
     const auto& operands = conv->operands();
     LTC_CHECK(!operands.empty());
-    const auto& input_size = operands[0].shape().dimensions();
-    const auto& weight_size = operands[1].shape().dimensions();
+    const auto& input_size = GetShapeFromTsOutput(operands[0]).dimensions();
+    const auto& weight_size = GetShapeFromTsOutput(operands[1]).dimensions();
     const auto& dilation = conv->dilation();
     const auto& padding = conv->padding();
     const auto& stride = conv->stride();
@@ -495,7 +495,7 @@ class TSNodeLowering : public NodeLowering {
           (input_size[d] + (2 * padding[d - 2]) - kernel) / stride[d - 2] + 1;
     }
 
-    return lazy_tensors::Shape(operands[0].shape().element_type(), output_size);
+    return lazy_tensors::Shape(GetShapeFromTsOutput(operands[0]).element_type(), output_size);
   }
 
   static lazy_tensors::Shape InferEmbeddingDenseBackward(
