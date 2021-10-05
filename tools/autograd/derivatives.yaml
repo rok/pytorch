@@ -1596,10 +1596,6 @@
   self: kl_div_backward(grad, self, target, reduction, log_target)
   target: kl_div_target_backward(grad, self, target, reduction, log_target)
 
-- name: l1_loss(Tensor self, Tensor target, int reduction=Mean) -> Tensor
-  self: l1_loss_backward(grad, self, target, reduction)
-  target: l1_loss_backward(grad, target, self, reduction)
-
 - name: mse_loss(Tensor self, Tensor target, int reduction=Mean) -> Tensor
   self: mse_loss_backward(grad, self, target, reduction)
   target: mse_loss_backward(grad, target, self, reduction)
@@ -1619,6 +1615,13 @@
 - name: nll_loss2d_forward(Tensor self, Tensor target, Tensor? weight, int reduction, int ignore_index) -> (Tensor output, Tensor total_weight)
   self: nll_loss2d_backward(grad, self, target, weight, reduction, ignore_index, total_weight)
   target: non_differentiable
+
+- name: l1_loss(Tensor self, Tensor target, int reduction=Mean) -> Tensor
+  self, target: "grad.defined() ? c_to_r_norm_backward(l1_loss_backward(grad, self, target, reduction), self, target) : std::tuple<Tensor, Tensor>()"
+
+- name: l1_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction) -> Tensor
+  grad_output: handle_r_to_c(grad_output.scalar_type(), l1_loss_backward(grad, self.conj(), target.conj(), reduction))
+  self, target: "grad.defined() ? c_to_r_norm_backward(l1_loss_double_backward(grad, grad_output, self, target, reduction), self, target) : std::tuple<Tensor, Tensor>()"
 
 - name: smooth_l1_loss(Tensor self, Tensor target, int reduction=Mean, float beta=1.0) -> Tensor
   self: smooth_l1_loss_backward(grad, self, target, reduction, beta)
@@ -1932,11 +1935,6 @@
 - name: hardtanh_backward(Tensor grad_output, Tensor self, Scalar min_val, Scalar max_val) -> Tensor
   grad_output: hardtanh_backward(grad, self, min_val, max_val)
   self: zeros_like(grad)
-
-- name: l1_loss_backward(Tensor grad_output, Tensor self, Tensor target, int reduction) -> Tensor
-  grad_output: l1_loss_double_backward_grad_output(grad, grad_output, self, target, reduction)
-  self: l1_loss_double_backward(grad, grad_output, self, target, reduction)
-  target: l1_loss_double_backward(grad, grad_output, target, target, reduction)
 
 - name: log_sigmoid_backward(Tensor grad_output, Tensor self, Tensor buffer) -> Tensor
   grad_output: log_sigmoid_backward(grad, self, buffer)

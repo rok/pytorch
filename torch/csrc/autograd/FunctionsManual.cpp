@@ -295,7 +295,7 @@ Tensor sgn_backward(Tensor result, Tensor grad, Tensor self) {
   if (self.is_complex()) {
     auto abs = at::abs(self);
     // C -> C
-    // https://arxiv.org/pdf/1701.00392.pdf Section 4.20
+    // https://arxiv.org/pdf/1701.00392.pdf Section 4.8 Equation 4.20
     return at::where(abs == 0.0, at::zeros({}, grad.options()), (grad/abs - (at::real(grad/self) * result)));
   } else {
     return at::zeros_like(self, at::MemoryFormat::Preserve);
@@ -1305,29 +1305,6 @@ Tensor binary_cross_entropy_double_backward_grad_output(const Tensor & grad, con
   return ggO;
 }
 
-Tensor l1_loss_double_backward(const Tensor & grad, const Tensor & grad_output, const Tensor & self, const Tensor & other, int64_t reduction) {
-  if (!self.is_complex()) {
-    return at::zeros_like(grad);
-  } else {
-    auto diff = self - other;
-    auto output = grad_output * sgn_backward(diff.sgn(), grad, diff);
-    if (reduction == at::Reduction::Mean) {
-      output /= self.numel();
-    }
-    return output;
-  }
-}
-
-Tensor l1_loss_double_backward_grad_output(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, int64_t reduction) {
-  auto output = at::l1_loss_backward(grad.conj(), input, target, at::Reduction::None);
-  if (reduction == at::Reduction::Mean) {
-    return output.mean();
-  } else if (reduction == at::Reduction::Sum) {
-    return output.sum();
-  }
-  return handle_r_to_c(grad_output, output);
-}
-
 Tensor smooth_l1_loss_double_backward(const Tensor & grad, const Tensor & input, const Tensor & target, int64_t reduction, double beta) {
   // special case to protect against a divide-by-zero.
   if (beta == 0) {
@@ -1339,6 +1316,29 @@ Tensor smooth_l1_loss_double_backward(const Tensor & grad, const Tensor & input,
     grad_input /= input.numel();
   }
   return grad_input;
+}
+
+// This is a helper function to compute gradients of functions C x C -> R of the form f(x-y)
+// If we get g = \grad f(x-y), we have that the gradient wrt x is g and the gradient with respect
+// to y is -g.
+std::tuple<Tensor, Tensor> c_to_r_norm_backward(const Tensor & grad, const Tensor & x, const Tensor & y) {
+  return std::make_tuple(handle_r_to_c(x.scalar_type(), grad),
+                         handle_r_to_c(y.scalar_type(), -grad));
+}
+
+Tensor l1_loss_double_backward(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, int64_t reduction) {
+  if (input.is_complex() || target.is_complex()) {
+    const auto z = input - target;
+    const auto ret = sgn_backward(at::sgn(z), grad, z) * grad_output;
+    if (reduction == at::Reduction::Mean) {
+      const auto n = c10::multiply_integers(at::infer_size(input.sizes(), target.sizes()));
+      return ret / n;
+    } else {
+      return ret;
+    }
+  } else {
+    return at::zeros_like(input);
+  }
 }
 
 Tensor smooth_l1_loss_double_backward_grad_output(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, int64_t reduction, double beta) {
