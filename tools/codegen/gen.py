@@ -17,8 +17,8 @@ from tools.codegen.model import (Argument, DispatchKey, FunctionSchema,
                                  BackendIndex, BackendMetadata,
                                  OptionalType, SchemaKind, SelfArgument,
                                  TensorOptionsArguments, Type, Variant,
-                                 assert_never, is_cuda_dispatch_key,
-                                 is_generic_dispatch_key)
+                                 assert_never, is_cuda_dispatch_key, is_ufunc_dispatch_key,
+                                 is_generic_dispatch_key, ScalarType)
 from tools.codegen.api.types import (Binding, CppSignature, CppSignatureGroup,
                                      DispatcherSignature, NativeSignature)
 from tools.codegen.api import cpp
@@ -1130,10 +1130,15 @@ def main() -> None:
     pathlib.Path(core_install_dir).mkdir(parents=True, exist_ok=True)
 
     def make_file_manager(install_dir: str) -> FileManager:
-        return FileManager(install_dir=install_dir, template_dir=template_dir, dry_run=options.output_dependencies)
+        return FileManager(
+            install_dir=install_dir,
+            template_dir=template_dir,
+            dry_run=options.output_dependencies
+        )
 
     core_fm = make_file_manager(core_install_dir)
     cpu_fm = make_file_manager(options.install_dir)
+    cpu_vec_fm = make_file_manager(options.install_dir)
     cuda_fm = make_file_manager(options.install_dir)
 
     extra_cuda_headers = '''\
@@ -1247,6 +1252,36 @@ def main() -> None:
                 )),
             })
 
+        for g in structured_native_functions:
+            if not g.out.ufunc_inner_loop or not is_ufunc_dispatch_key(dispatch_key):
+                continue
+            name = g.functional.func.name.name
+            if dispatch_key is DispatchKey.CPU:
+                assert fm is cpu_fm
+                fm.write_with_template(f'UfuncCPU_{name}.cpp', 'UfuncCPU.cpp', lambda: {
+                    'meta_declaration': compute_meta_function_declaration(g),
+                    'native_declaration':
+                        dest.compute_native_function_declaration(g, backend_indices[dispatch_key]),
+                    'native_definitions': dest.compute_ufunc_cpu(g),
+                })
+                cpu_vec_fm.write_with_template(f'UfuncCPUKernel_{name}.cpp', 'UfuncCPUKernel.cpp', lambda: {
+                    'name': name,
+                    'native_definitions': dest.compute_ufunc_cpu_kernel(g),
+                })
+            elif dispatch_key is DispatchKey.CUDA:
+                fm.write_with_template(f'UfuncCUDA_{name}.cu', 'UfuncCUDA.cu', lambda: {
+                    'name': name,
+                    #'meta_declaration': compute_meta_function_declaration(g),
+                    #'native_declaration':
+                    #    dest.compute_native_function_declaration(g, backend_indices[dispatch_key]),
+                    # TODO: fix so that NativeFunctions.h isn't indirectly
+                    # included
+                    'meta_declaration': '',
+                    'native_definitions': dest.compute_ufunc_cuda(g),
+                })
+            else:
+                raise AssertionError(f'unrecognized {dispatch_key} for ufunc')
+
         del fm
 
     # BackendSelect is generated specially
@@ -1329,6 +1364,7 @@ def main() -> None:
 
     if options.output_dependencies:
         cpu_fm.write_outputs(options.output_dependencies)
+        cpu_vec_fm.write_outputs(f"{options.output_dependencies}-cpu-vec")
         core_fm.write_outputs(f"{options.output_dependencies}-core")
         cuda_fm.write_outputs(f"{options.output_dependencies}-cuda")
 
