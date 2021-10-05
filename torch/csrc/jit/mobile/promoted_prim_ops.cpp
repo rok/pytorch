@@ -180,7 +180,9 @@ static const C10_UNUSED std::array<mobile::prim_op_fn_register, 14> op_reg = {
     mobile::prim_op_fn_register("aten::dim", dim),
     mobile::prim_op_fn_register("prim::Uninitialized", unInitialized),
     mobile::prim_op_fn_register("aten::to.prim_dtype", toPrimDType),
-    mobile::prim_op_fn_register("prim::is_cuda", isCuda)
+    mobile::prim_op_fn_register("prim::is_cuda", isCuda),
+    mobile::prim_op_fn_register("aten::__getitem__.Dict_str", dictIndex),
+    mobile::prim_op_fn_register("prim::unchecked_cast", noop),
     // TODO: (@pavithran) size is overloaded with int[] and Tensor
     // so this throws error expecting int not Tensor
     // mobile::prim_op_fn_register("aten::size", size)
